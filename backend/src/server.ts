@@ -16,11 +16,13 @@ app.use(express.json());
 // Get queue URLs by name prefix
 app.get('/api/queues', async (req, res) => {
   try {
+    console.log(`[${new Date().toISOString()}] Fetching queues...`);
     // List all queues
     const listCommand = new ListQueuesCommand({});
     const listResponse = await sqsClient.send(listCommand);
     
     const queueUrls = listResponse.QueueUrls || [];
+    console.log(`[${new Date().toISOString()}] Found ${queueUrls.length} total queues`);
     
     // Get attributes for each queue
     const queues = await Promise.all(
@@ -49,6 +51,8 @@ app.get('/api/queues', async (req, res) => {
       q.name.includes('email') || q.name.includes('dlq')
     );
     
+    console.log(`[${new Date().toISOString()}] Returning ${emailQueues.length} email queues`);
+    
     res.json(emailQueues);
   } catch (error) {
     console.error('Error fetching queues:', error);
@@ -70,17 +74,21 @@ app.get('/api/queues/:queueName/messages', async (req, res) => {
       return res.status(404).json({ error: 'Queue not found' });
     }
     
-    // Receive messages (non-destructive, just peeking)
+    // Receive messages with 0 visibility timeout (peek only, don't make invisible)
     const receiveCommand = new ReceiveMessageCommand({
       QueueUrl: queueUrl,
       MaxNumberOfMessages: 10,
       WaitTimeSeconds: 0,
+      VisibilityTimeout: 0, // Messages remain visible immediately
       AttributeNames: ['All'],
       MessageAttributeNames: ['All']
     });
     
+    console.log(`[${new Date().toISOString()}] Peeking messages from ${queueName}...`);
     const receiveResponse = await sqsClient.send(receiveCommand);
     const messages = receiveResponse.Messages || [];
+    
+    console.log(`[${new Date().toISOString()}] Found ${messages.length} messages in ${queueName}`);
     
     res.json({
       queueName,
