@@ -1,14 +1,14 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { getQueues, Queue } from '../api';
 
 interface QueueListProps {
-  selectedQueue: string | null;
-  onSelectQueue: (queueName: string) => void;
+  selectedQueue: Queue | null;
+  onSelectQueue: (queue: Queue) => void;
 }
 
 export function QueueList({ selectedQueue, onSelectQueue }: QueueListProps) {
   const [queues, setQueues] = useState<Queue[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const fetchQueues = async () => {
@@ -24,13 +24,10 @@ export function QueueList({ selectedQueue, onSelectQueue }: QueueListProps) {
     }
   };
 
-  useEffect(() => {
-    fetchQueues();
-  }, []);
+  // No auto-fetch — queues are loaded only on manual refresh
 
   const formatNumber = (n: number) => n.toLocaleString();
 
-  if (loading) return <div className="loading">Loading queues...</div>;
   if (error) return (
     <div className="error-state">
       <p>Error: {error}</p>
@@ -42,18 +39,22 @@ export function QueueList({ selectedQueue, onSelectQueue }: QueueListProps) {
     <div className="queue-list">
       <div className="queue-list-header">
         <h2>Queues</h2>
-        <button onClick={fetchQueues}>Refresh</button>
+        <button onClick={fetchQueues} disabled={loading}>
+          {loading ? 'Loading...' : queues.length === 0 ? 'Load Queues' : 'Refresh'}
+        </button>
       </div>
-      
+
       {queues.length === 0 ? (
-        <div className="empty-state">No SQS queues found in this region.</div>
+        <div className="empty-state">
+          {loading ? 'Loading queues...' : 'Click "Load Queues" to fetch queue list.'}
+        </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
           {queues.map(queue => (
             <div
               key={queue.name}
-              onClick={() => onSelectQueue(queue.name)}
-              className={`queue-item ${selectedQueue === queue.name ? 'selected' : ''}`}
+              onClick={() => onSelectQueue(queue)}
+              className={`queue-item ${selectedQueue?.name === queue.name ? 'selected' : ''}`}
             >
               <div className="queue-item-name">{queue.name}</div>
               <div className="queue-item-stats">

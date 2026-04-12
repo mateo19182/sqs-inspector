@@ -1,4 +1,4 @@
-import { SQSClient, GetQueueUrlCommand, GetQueueAttributesCommand, ReceiveMessageCommand, ListQueuesCommand } from '@aws-sdk/client-sqs';
+import { SQSClient, GetQueueUrlCommand, GetQueueAttributesCommand, ReceiveMessageCommand, ListQueuesCommand, PurgeQueueCommand, SendMessageCommand, DeleteMessageCommand } from '@aws-sdk/client-sqs';
 import express from 'express';
 import cors from 'cors';
 
@@ -34,6 +34,9 @@ app.get('/api/queues', async (req, res) => {
         const attrsResponse = await sqsClient.send(attrsCommand);
         
         const name = url.split('/').pop() || 'unknown';
+        const redrivePolicy = attrsResponse.Attributes?.RedrivePolicy
+          ? JSON.parse(attrsResponse.Attributes.RedrivePolicy)
+          : null;
         return {
           name,
           url,
@@ -41,7 +44,8 @@ app.get('/api/queues', async (req, res) => {
           approximateNumberOfMessagesNotVisible: parseInt(attrsResponse.Attributes?.ApproximateNumberOfMessagesNotVisible || '0'),
           created: attrsResponse.Attributes?.CreatedTimestamp,
           lastModified: attrsResponse.Attributes?.LastModifiedTimestamp,
-          messageRetentionPeriod: parseInt(attrsResponse.Attributes?.MessageRetentionPeriod || '0')
+          messageRetentionPeriod: parseInt(attrsResponse.Attributes?.MessageRetentionPeriod || '0'),
+          maxReceiveCount: redrivePolicy?.maxReceiveCount ?? null,
         };
       })
     );
@@ -64,49 +68,153 @@ app.get('/api/queues', async (req, res) => {
 app.get('/api/queues/:queueName/messages', async (req, res) => {
   try {
     const { queueName } = req.params;
-    
+    const maxBatches = Math.min(Math.max(parseInt(req.query.maxBatches as string) || 1, 1), 20);
+
     // Get queue URL
     const getUrlCommand = new GetQueueUrlCommand({ QueueName: queueName });
     const urlResponse = await sqsClient.send(getUrlCommand);
     const queueUrl = urlResponse.QueueUrl;
-    
+
     if (!queueUrl) {
       return res.status(404).json({ error: 'Queue not found' });
     }
-    
-    // Receive messages with 0 visibility timeout (peek only, don't make invisible)
-    const receiveCommand = new ReceiveMessageCommand({
-      QueueUrl: queueUrl,
-      MaxNumberOfMessages: 10,
-      WaitTimeSeconds: 0,
-      VisibilityTimeout: 0, // Messages remain visible immediately
-      AttributeNames: ['All'],
-      MessageAttributeNames: ['All']
-    });
-    
-    console.log(`[${new Date().toISOString()}] Peeking messages from ${queueName}...`);
-    const receiveResponse = await sqsClient.send(receiveCommand);
-    const messages = receiveResponse.Messages || [];
-    
-    console.log(`[${new Date().toISOString()}] Found ${messages.length} messages in ${queueName}`);
-    
+
+    console.log(`[${new Date().toISOString()}] Peeking messages from ${queueName} (${maxBatches} batches)...`);
+
+    const seen = new Map<string, typeof messages[number]>();
+    const messages: {
+      messageId?: string;
+      receiptHandle?: string;
+      body?: string;
+      attributes?: Record<string, string>;
+      messageAttributes?: Record<string, any>;
+      md5OfBody?: string;
+      md5OfMessageAttributes?: string;
+    }[] = [];
+
+    let emptyBatches = 0;
+
+    for (let i = 0; i < maxBatches; i++) {
+      const receiveCommand = new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 0,
+        VisibilityTimeout: 0,
+        AttributeNames: ['All'],
+        MessageAttributeNames: ['All']
+      });
+
+      const receiveResponse = await sqsClient.send(receiveCommand);
+      const batch = receiveResponse.Messages || [];
+
+      if (batch.length === 0) {
+        emptyBatches++;
+        if (emptyBatches >= 2) break; // Stop early if queue seems empty
+        continue;
+      }
+
+      for (const msg of batch) {
+        if (msg.MessageId && !seen.has(msg.MessageId)) {
+          const mapped = {
+            messageId: msg.MessageId,
+            receiptHandle: msg.ReceiptHandle,
+            body: msg.Body,
+            attributes: msg.Attributes,
+            messageAttributes: msg.MessageAttributes,
+            md5OfBody: msg.MD5OfBody,
+            md5OfMessageAttributes: msg.MD5OfMessageAttributes
+          };
+          seen.set(msg.MessageId, mapped);
+          messages.push(mapped);
+        }
+      }
+    }
+
+    console.log(`[${new Date().toISOString()}] Found ${messages.length} unique messages in ${queueName}`);
+
     res.json({
       queueName,
       queueUrl,
       messageCount: messages.length,
-      messages: messages.map(msg => ({
-        messageId: msg.MessageId,
-        receiptHandle: msg.ReceiptHandle,
-        body: msg.Body,
-        attributes: msg.Attributes,
-        messageAttributes: msg.MessageAttributes,
-        md5OfBody: msg.MD5OfBody,
-        md5OfMessageAttributes: msg.MD5OfMessageAttributes
-      }))
+      messages,
     });
   } catch (error) {
     console.error('Error fetching messages:', error);
     res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Purge all messages from a queue
+app.delete('/api/queues/:queueName/messages', async (req, res) => {
+  try {
+    const { queueName } = req.params;
+    const getUrlCommand = new GetQueueUrlCommand({ QueueName: queueName });
+    const urlResponse = await sqsClient.send(getUrlCommand);
+    const queueUrl = urlResponse.QueueUrl;
+    if (!queueUrl) return res.status(404).json({ error: 'Queue not found' });
+
+    console.log(`[${new Date().toISOString()}] Purging queue ${queueName}...`);
+    await sqsClient.send(new PurgeQueueCommand({ QueueUrl: queueUrl }));
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error purging queue:', error);
+    res.status(500).json({ error: 'Failed to purge queue' });
+  }
+});
+
+// Redrive a message from a DLQ back to the target queue
+app.post('/api/queues/:queueName/messages/redrive', async (req, res) => {
+  try {
+    const { queueName } = req.params;
+    const { messageId, targetQueueName } = req.body as { messageId: string; targetQueueName: string };
+
+    const sourceUrlResp = await sqsClient.send(new GetQueueUrlCommand({ QueueName: queueName }));
+    const sourceQueueUrl = sourceUrlResp.QueueUrl;
+    if (!sourceQueueUrl) return res.status(404).json({ error: 'Source queue not found' });
+
+    const targetUrlResp = await sqsClient.send(new GetQueueUrlCommand({ QueueName: targetQueueName }));
+    const targetQueueUrl = targetUrlResp.QueueUrl;
+    if (!targetQueueUrl) return res.status(404).json({ error: 'Target queue not found' });
+
+    // Scan the DLQ to find the specific message and lock it with a visibility timeout
+    let foundMessage: { Body?: string; MessageId?: string; ReceiptHandle?: string; MessageAttributes?: Record<string, any> } | null = null;
+    for (let i = 0; i < 20 && !foundMessage; i++) {
+      const receiveResp = await sqsClient.send(new ReceiveMessageCommand({
+        QueueUrl: sourceQueueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 0,
+        VisibilityTimeout: 30,
+        AttributeNames: ['All'],
+        MessageAttributeNames: ['All'],
+      }));
+      const batch = receiveResp.Messages || [];
+      if (batch.length === 0) break;
+      foundMessage = batch.find(m => m.MessageId === messageId) ?? null;
+    }
+
+    if (!foundMessage) {
+      return res.status(404).json({ error: 'Message not found in queue' });
+    }
+
+    console.log(`[${new Date().toISOString()}] Redriving message ${messageId} from ${queueName} to ${targetQueueName}...`);
+
+    await sqsClient.send(new SendMessageCommand({
+      QueueUrl: targetQueueUrl,
+      MessageBody: foundMessage.Body,
+      ...(foundMessage.MessageAttributes && Object.keys(foundMessage.MessageAttributes).length > 0
+        ? { MessageAttributes: foundMessage.MessageAttributes }
+        : {}),
+    }));
+
+    await sqsClient.send(new DeleteMessageCommand({
+      QueueUrl: sourceQueueUrl,
+      ReceiptHandle: foundMessage.ReceiptHandle,
+    }));
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error redriving message:', error);
+    res.status(500).json({ error: 'Failed to redrive message' });
   }
 });
 
